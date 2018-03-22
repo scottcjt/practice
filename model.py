@@ -6,6 +6,7 @@ from tensorflow.contrib import seq2seq
 
 MODE_EVAL = 0
 MODE_TRAIN = 1
+KEEP = 0.7
 
 
 class GrammarCorrectionModel(object):
@@ -14,7 +15,6 @@ class GrammarCorrectionModel(object):
         return self._mode != 'train'
 
     def _variable(self, name, **kwargs):
-        KEEP = 0.9
 
         v = tf.get_variable(name, **kwargs)
         if self._mode == 'train':
@@ -22,11 +22,10 @@ class GrammarCorrectionModel(object):
 
         return v
 
-    def _rnn_cells(self, num_units, layers,
-                   input_keep_prob=0.9, output_keep_prob=0.9, state_keep_prob=0.9):
+    def _rnn_cells(self, num_units, layers):
         cells = [tf.nn.rnn_cell.BasicLSTMCell(num_units) for _ in range(layers)]
         if self._mode == 'train':
-            cells = [tf.nn.rnn_cell.DropoutWrapper(c, input_keep_prob, output_keep_prob, state_keep_prob)
+            cells = [tf.nn.rnn_cell.DropoutWrapper(c, KEEP, KEEP, KEEP)
                      for c in cells]
 
         if layers > 1:
@@ -59,7 +58,14 @@ class GrammarCorrectionModel(object):
 
                 # This layer sits just before softmax. It seems that if an activation is placed here,
                 # the network will not converge well. Why?
-                final_projection = tf.layers.Dense(self._word_symbols, use_bias=False)
+                def apply_dropout(v):
+                    if self._mode == 'train':
+                        return tf.nn.dropout(v, KEEP)
+                    else:
+                        return v
+
+                final_projection = tf.layers.Dense(
+                    self._word_symbols, kernel_regularizer=apply_dropout, use_bias=False)
 
                 if self._mode != 'infer':
                     batch_target_embeds = tf.nn.embedding_lookup(embeds, ys)
@@ -148,7 +154,7 @@ class GrammarCorrectionModel(object):
             out_lens_no_eos = self._infer_lens - 1
             copied = self._compare_batch(
                 padded_in, self._xlens_ph, padded_out, out_lens_no_eos)
-            copied = tf.count_nonzero(copied)
+            copied = tf.count_nonzero(copied) / self._batch_size
 
             return accuracy, precision, recall, copied
 
@@ -315,7 +321,7 @@ class GrammarCorrectionModel(object):
                         saver.save(sess, 'train/checkpoints/step-{}'.format(i))
 
 
-data = lang8.Lang8Data('lang8-10p')
+data = lang8.Lang8Data('lang8-1p', 'lang8-1p_vocab')
 
 model = GrammarCorrectionModel(data.start_symbol, data.end_symbol, data.pad_symbol)
 model.run(data)

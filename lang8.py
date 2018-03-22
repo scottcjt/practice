@@ -3,12 +3,8 @@ import numpy as np
 import collections
 import random
 import string
-import sys
+import tempfile
 
-
-_PUNCTS = '.,!;:\'"`~!@#$%^&*()-_=+\|[]{}<>?'
-_FACES = 'DPO'
-_EYES = ';:'
 
 _PEEPHOLES = [
     ('a . m .', 'a.m.'),
@@ -20,67 +16,27 @@ _PEEPHOLES = [
     ('N \' T\t', ' N\'T\t'),
 ]
 
-_MAPPINGS = [
-    ('.', '<eos>'),
-    ('\'"`', '<quote>'),
-    ('([{<', '<Lbracket>'),
-    (')]}>', '<Rbracket>'),
-]
 
-
-def _preprocess_line(line):
+def _peephole(line):
     line = line.strip()
 
     # Peepholes
     for old, new in _PEEPHOLES:
         line = line.replace(old, new)
 
-    # TODO: Detect emoji here?
-
-    # Grouping punctuations
-    # for old, new in _MAPPINGS:
-    #     line = line.replace(old, new)
-
     return line
 
 
-def _preprocess_tokens(tokens):
-    for i in range(len(tokens)):
-        if tokens[i].isnumeric():
-            tokens[i] = '<num>'
-    for i in range(len(tokens)):
-        if len(tokens[i]) == 1 and not tokens[i].isalpha():
-            tokens[i] = '<pun>'
-
-    # cont = True
-    # while cont:
-    #     cont = False
-    #     for i in range(1, len(tokens)):
-    #         if tokens[i-1] in _PUNCTS and tokens[i] in _PUNCTS:
-    #             merged = tokens[i-1] + tokens[i]
-    #             tokens[i-1:i+1] = [merged]
-    #             print('merged: ' + merged)
-    #             cont = True
-    #             break
-    return tokens
-
-
-def _preprocess(line):
-    line = _preprocess_line(line)
-    x, y = line.split('\t')
-    return x, y
+def _preprocessed(fp):
+    fp.seek(0, 0)
+    for line in fp:
+        yield _peephole(line)
 
 
 def _tokenize(sentence, codebook):
     tokens = sentence.split()
     ids = [codebook(tok) for tok in tokens]
     return ids
-    # keys_of_seq = []
-    # for tok in tokens:
-    #     keys = [codebook(k) for k in tok]
-    #     keys_of_seq.append(keys)
-    #
-    # return keys_of_seq
 
 
 def _form_sentence_nparray(seq, pad_to):
@@ -171,13 +127,20 @@ class Lang8Data(object):
 
     Batch = collections.namedtuple('Batch', 'xs xlens ys ylens zs zlens')
 
-    def _tidy(self):
-        unwanted = list(self._punct_whitelist) + ['<pun>', '<num>']
+    @staticmethod
+    def _corpus_iter(fp):
+        fp.seek(0, 0)
+        while True:
+            for line in fp:
+                yield line.strip()
+            fp.seek(0, 0)
+
+    def _tidy_and_build_corpus(self, lines):
+        unwanted = list(self._punct_whitelist) + ['<pun>', '<num>', '<unk>']
         unwanted = [self.word2code(x) for x in unwanted]
 
-        lines2 = []
-        for line in self.lines:
-            line = _preprocess_line(line)
+        valid_lines = []
+        for i, line in enumerate(lines):
             x, y = line.split('\t')
             xt = _tokenize(x, self.word2code)
             yt = _tokenize(y, self.word2code)
@@ -188,14 +151,40 @@ class Lang8Data(object):
             c = collections.Counter(xt)
             unwanted_count = sum([c[x] for x in unwanted])
             if unwanted_count >= (len(xt) / 2):
-                # print(x)
                 continue
 
-            lines2.append(line)
+            valid_lines.append(line + '\n')
 
-        print('Read in {} lines, keep {} lines'.format(len(self.lines), len(lines2)))
-        random.shuffle(lines2)
-        self.lines = lines2
+        print('Read in {} lines, keep {} lines'.format(i, len(valid_lines)))
+
+        total = len(valid_lines)
+        train_n = int(total * 0.8)
+        eval_n = int(total * 0.1)
+        test_n = int(total * 0.1)
+        train_n += total - (train_n + eval_n + test_n)
+
+        random.shuffle(valid_lines)
+
+        self._training_tmp = tempfile.TemporaryFile(mode='w+')
+        self._training_tmp.writelines(valid_lines[:train_n])
+        self._training_tmp.flush()
+        self._train_n = train_n
+
+        self._eval_tmp = tempfile.TemporaryFile(mode='w+')
+        self._eval_tmp.writelines(valid_lines[train_n:train_n+eval_n])
+        self._eval_tmp.flush()
+        self._eval_n = eval_n
+
+        self._test_tmp = tempfile.TemporaryFile(mode='w+')
+        self._test_tmp.writelines(valid_lines[train_n+eval_n:])
+        self._test_tmp.flush()
+        self._test_n = test_n
+
+        self._cats = {
+            self.TRAIN: self._corpus_iter(self._training_tmp),
+            self.VALIDATE: self._corpus_iter(self._eval_tmp),
+            self.TEST: self._corpus_iter(self._test_tmp),
+        }
 
     @classmethod
     def _force_unk(cls, word):
@@ -209,24 +198,18 @@ class Lang8Data(object):
     def _is_punct(cls, word):
         return len(word) == 1 and word not in cls._punct_whitelist and word in string.punctuation
 
-    def _init_codebook(self):
-        # unk must be 0
-        # symbols = ['<unk>', '<pun>', '.', '?', '!', ',', '-']
-        # symbols.extend(string.ascii_letters)
-        # symbols.extend(string.digits)
-        #
-        # self.char_codebook = {c: i for i, c in enumerate(symbols)}
-
+    def _build_codebook(self, lines, save_vocab_table):
         codes = ['<pad>', '<unk>',
                  '<start>', '<end>',
                  '<num>', '<pun>'] + [c for c in self._punct_whitelist]
         pick = self.vocab_size - len(codes)
 
-        # Pick words from `correct' parts.
         counter = collections.Counter()
-        for line in self.lines:
-            line = line.split('\t')[1].strip()
-            words = line.split()
+        for line in lines:
+            # Pick words from `correct' parts.
+            y = line.split('\t')[1].strip()
+
+            words = y.split()
             for w in words:
                 # exclude those too short/long
                 if self._force_unk(w):
@@ -247,6 +230,11 @@ class Lang8Data(object):
         self.word_codebook = {w:i for i, w in enumerate(codes)}
         self.word_codebook_rev = {i:w for i, w in enumerate(codes)}
         self._unk = self.word_codebook['<unk>']
+
+        # write vocab table
+        with open(save_vocab_table, mode='w') as fout:
+            for w in codes:
+                fout.write('{}\n'.format(w))
 
     # def char_code(self, c):
     #     if c in self.char_codebook:
@@ -278,57 +266,21 @@ class Lang8Data(object):
     def end_symbol(self):
         return self.word_codebook['<end>']
 
-    # @property
-    # def char_max(self):
-    #     return len(self.char_codebook)
-    class Samples(object):
-        def __init__(self, samples, bucketing=False):
-            self._samples = samples
-            self._cursor = 0
-            self._sort = bucketing
-
-            if self._sort:
-                self._samples.sort(key=len)
-
-        def get(self, n):
-            take = self._samples[self._cursor:self._cursor + n]
-            self._cursor += len(take)
-            if len(take) < n:
-                wrap = n - len(take)
-                take += self._samples[:wrap]
-                self._cursor = wrap
-
-            return take
-
-        @property
-        def size(self):
-            return len(self._samples)
-
-    def __init__(self, filename, keys_per_word=20, vocab_size=20000, bucketing=True):
-        with open(filename, mode='r') as fp:
-            self.lines = fp.readlines()
-
-        self.keys_per_word = keys_per_word
+    def __init__(self, filename, save_vocab_table, vocab_size=20000):
         self.vocab_size = vocab_size
 
-        self._init_codebook()
-        self._tidy()
-
-        total = len(self.lines)
-        train = int(total * 0.8)
-        validate = int(total * 0.1)
-        test = int(total * 0.1)
-        train += total - (train + validate + test)
-
-        self._data_cats = {self.TRAIN: self.Samples(self.lines[:train], bucketing),
-                           self.VALIDATE: self.Samples(self.lines[train:train+validate]),
-                           self.TEST: self.Samples(self.lines[train:train+validate:])}
+        with open(filename, mode='r') as fp:
+            preprocessed = _preprocessed(fp)
+            self._build_codebook(preprocessed, save_vocab_table)
+            preprocessed = _preprocessed(fp)
+            self._tidy_and_build_corpus(preprocessed)
 
     def next_batch(self, n=128, cat=TRAIN):
-        data = self._data_cats[cat]
-        picked = data.get(n)
+        data = self._cats[cat]
 
-        xstrs, ystrs = zip(*[_preprocess(line) for line in picked])
+        picked = [x.split('\t') for _, x in zip(range(n), data)]
+
+        xstrs, ystrs = zip(*picked)
 
         xtoks = [_tokenize(x, self.word2code) for x in xstrs]
         ytoks = [[self.start_symbol] + _tokenize(y, self.word2code) for y in ystrs]
@@ -344,10 +296,14 @@ class Lang8Data(object):
 
     @property
     def epoch_batches(self, batch_size=128):
-        return self._data_cats[self.TRAIN].size // batch_size
+        return self._train_n // batch_size
 
 
-# data = Lang8Data('lang8-10p')
+# data = Lang8Data('lang8-10p', 'lang8-10p_vocab')
+#
+# for _ in range(100):
+#     b = data.next_batch(cat=data.TEST)
+#     print(b)
 #
 # b = data.next_batch(128)
 # for x, xl, y, yl, z, zl in zip(b.xs, b.xlens, b.ys, b.ylens, b.zs, b.zlens):
