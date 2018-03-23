@@ -142,6 +142,7 @@ class GrammarCorrectionModel(object):
             fp_count = tf.count_nonzero(fp_samples, dtype=tf.float32)
             # precision = TP / TP+FP
             precision = tp_count / (tp_count + fp_count)
+            precision = tf.where(tf.is_nan(precision), 0.0, precision)
             # recall = TP / TP+FN
             recall = tp_count / accurate_count
             recall = tf.where(tf.is_nan(recall), 0.0, recall)
@@ -189,21 +190,24 @@ class GrammarCorrectionModel(object):
 
         return norm, opt.apply_gradients(zip(gradients, params), global_step=steps)
 
-    def __init__(self, start_symbol, end_symbol, pad_symbol):
+    def __init__(self, start_symbol, end_symbol, pad_symbol,
+                 batch_size, embed_size, hidden_size, logdir, ckptdir):
         # self._char_model_rnn_hidden_size = 128
         # self._char_model_rnn_layers = 2
         # self._char_symbols = 72
 
-        self._batch_size = 32
+        self._batch_size = batch_size
         self._word_symbols = 20000
         self._start_token = start_symbol
         self._end_token = end_symbol
         self._pad_token = pad_symbol
 
-        self._word_embedding_size = 64
-        self._word_model_rnn_hidden_size = 128
+        self._word_embedding_size = embed_size
+        self._word_model_rnn_hidden_size = hidden_size
         self._word_model_rnn_layers = 2
-        self._decoder_attention_size = 128
+        self._decoder_attention_size = hidden_size
+        self._logdir = logdir
+        self._ckptdir = ckptdir
 
         self._xs_ph = tf.placeholder(tf.int32, [self._batch_size, None], 'input/xs')
         self._xlens_ph = tf.placeholder(tf.int32, [self._batch_size], 'input/xlens')
@@ -266,13 +270,12 @@ class GrammarCorrectionModel(object):
             tf.summary.scalar('eval/copy', self._copied),
             ])
 
-    def run(self, data_feeder):
+    def run(self, data_feeder, epochs):
         saver = tf.train.Saver()
-        with tf.summary.FileWriter('train/logs', tf.get_default_graph()) as summary_writer:
+        with tf.summary.FileWriter(self._logdir, tf.get_default_graph()) as summary_writer:
             with tf.Session() as sess:
                 sess.run(tf.global_variables_initializer())
 
-                epochs = 10
                 n = data_feeder.epoch_batches
                 interval = 10
                 save_interval = 100
@@ -318,13 +321,13 @@ class GrammarCorrectionModel(object):
                         print('batch {:5d}: loss={:.4f} v_loss={:.4f} norm={:.4f}'.format(i, loss, v_loss, grad_norm))
 
                     if i % save_interval == 0:
-                        saver.save(sess, 'train/checkpoints/step-{}'.format(i))
+                        saver.save(sess, self._ckptdir + '/step-{}'.format(i))
 
 
-data = lang8.Lang8Data('lang8-1p', 'lang8-1p_vocab')
-
-model = GrammarCorrectionModel(data.start_symbol, data.end_symbol, data.pad_symbol)
-model.run(data)
+# data = lang8.Lang8Data('lang8-1p', 'lang8-1p_vocab')
+#
+# model = GrammarCorrectionModel(data.start_symbol, data.end_symbol, data.pad_symbol)
+# model.run(data)
 
 
 #
