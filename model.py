@@ -320,17 +320,24 @@ class GrammarCorrectionModel(object):
 
                         # Randomly pick a sample to display.
                         in_ids = batch.xs[0][:batch.xlens[0]]
-                        in_words = ' '.join([data_feeder.code2word(x) for x in in_ids])
-                        out_ids = v_out[0][:v_len[0]]
-                        out_words = ' '.join([data_feeder.code2word(x) for x in out_ids])
+                        in_str = ' '.join([data_feeder.code2word(x) for x in in_ids])
+                        out_ids = v_out[0][:v_len[0]-1]
+                        out_str = ' '.join([data_feeder.code2word(x) for x in out_ids])
+                        if out_str == '':
+                            out_str = '(empty string)'
+                        answer_ids = batch.ys[0][1:batch.ylens[0]]
+                        answer_str = ' '.join([data_feeder.code2word(x) for x in answer_ids])
 
                         print('batch {:5d}: loss={:.4f} v_loss={:.4f} norm={:.4f}'.format(i, loss, v_loss, grad_norm))
-                        print('sample in  : ' + in_words)
-                        print('sample out : ' + out_words)
+                        print('sample in  : ' + in_str)
+                        print('sample out : ' + out_str)
+                        print('answer     : ' + answer_str)
 
                         if i % (5 * interval) == 0:
                             # In order to post it to TensorBoard...
-                            sample = tf.make_tensor_proto('{}<br>\n{}\n'.format(in_words, out_words))
+                            logstr = '**In :** {}<br>\n**Out:** {}<br>\n**Ans:** {}\n'.format(
+                                in_str, out_str, answer_str)
+                            sample = tf.make_tensor_proto(logstr)
                             meta = tf.SummaryMetadata(
                                 plugin_data=tf.SummaryMetadata.PluginData(plugin_name='text'))
                             summary = tf.summary.Summary()
