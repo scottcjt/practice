@@ -309,16 +309,35 @@ class GrammarCorrectionModel(object):
                             self._ylens_ph: batch.ylens,
                             self._zs_ph: batch.zs,
                         }
-                        fetches = [self._v_loss, self._v_summaries]
+                        fetches = [self._v_loss, self._v_summaries, self._infer_outs, self._infer_lens]
 
-                        v_loss, v_summaries = sess.run(fetches, feeds)
+                        v_loss, v_summaries, v_out, v_len = sess.run(fetches, feeds)
 
                         # Write summaries.
                         step = self._global_step.eval(sess)
                         summary_writer.add_summary(ret[self._summaries], global_step=step)
                         summary_writer.add_summary(v_summaries, global_step=step)
 
+                        # Randomly pick a sample to display.
+                        in_ids = batch.xs[0][:batch.xlens[0]]
+                        in_words = ' '.join([data_feeder.code2word(x) for x in in_ids])
+                        out_ids = v_out[0][:v_len[0]]
+                        out_words = ' '.join([data_feeder.code2word(x) for x in out_ids])
+
                         print('batch {:5d}: loss={:.4f} v_loss={:.4f} norm={:.4f}'.format(i, loss, v_loss, grad_norm))
+                        print('sample in  : ' + in_words)
+                        print('sample out : ' + out_words)
+
+                        if i % (5 * interval) == 0:
+                            # In order to post it to TensorBoard...
+                            sample = tf.make_tensor_proto('{}<br>\n{}\n'.format(in_words, out_words))
+                            meta = tf.SummaryMetadata(
+                                plugin_data=tf.SummaryMetadata.PluginData(plugin_name='text'))
+                            summary = tf.summary.Summary()
+                            summary.value.add(tag='eval/human_readable_sample',
+                                              metadata=meta,
+                                              tensor=sample)
+                            summary_writer.add_summary(summary, global_step=step)
 
                     if i % save_interval == 0:
                         saver.save(sess, self._ckptdir + '/step-{}'.format(i))
