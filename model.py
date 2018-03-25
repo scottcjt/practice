@@ -95,15 +95,35 @@ class GrammarCorrectionModel(object):
         assert ys.shape.is_compatible_with([self._batch_size, None])
         assert ylens.shape == [self._batch_size]
 
+        # For each sequence, we have to use the longer sequence length.
+        lens = tf.maximum(xlens, ylens)
+
         dirty_comp = tf.equal(xs, ys)
-        # mask all `unused' elements as true (use any of two length arrays)
-        inv_mask = tf.logical_not(
-            tf.sequence_mask(xlens, maxlen=tf.shape(xs)[1]))
+        # mask all `unused' elements as true
+        mask = tf.sequence_mask(lens, maxlen=tf.shape(xs)[1])
+        inv_mask = tf.logical_not(mask)
         masked = tf.logical_or(dirty_comp, inv_mask)
-        # the same size & the same values in range
-        equal_samples = tf.logical_and(tf.equal(xlens, ylens), tf.reduce_all(masked, axis=1))
+
+        # per sequence stat
+        equal_samples = tf.reduce_all(masked, axis=1)
 
         return equal_samples
+
+    def _compare_batch_by_element(self, sequences, lengths, targets, target_lengths):
+        assert sequences.shape.is_compatible_with([self._batch_size, None])
+        assert lengths.shape == [self._batch_size]
+        assert targets.shape.is_compatible_with([self._batch_size, None])
+        assert target_lengths.shape == [self._batch_size]
+
+        # This time we always compare against targets.
+        dirty_comp = tf.equal(sequences, targets)
+        mask = tf.sequence_mask(target_lengths, maxlen=tf.shape(sequences)[1])
+
+        # per unit stats
+        equal_elements = tf.logical_and(dirty_comp, mask)
+        unequal_elements = tf.logical_and(tf.logical_not(dirty_comp), mask)
+
+        return equal_elements, unequal_elements
 
     def _build_eval(self, targets, target_lens):
         """Perform true evaluation and compute accuracy/recall."""
@@ -157,7 +177,33 @@ class GrammarCorrectionModel(object):
                 padded_in, self._xlens_ph, padded_out, out_lens_no_eos)
             copied = tf.count_nonzero(copied) / self._batch_size
 
-            return accuracy, precision, recall, copied
+            # Element-wise stats
+            non_relevant_elems, relevant_elems = self._compare_batch_by_element(
+                self._xs_ph, self._xlens_ph, targets, target_lens_no_eos)
+            accurate_elems, inaccurate_elems = self._compare_batch_by_element(
+                padded_out, self._infer_lens, padded_targets, target_lens)
+
+            # WTF this is really annoying...
+
+            # TP = relevant (TP+FN) & (TP+TN)
+            tp_elems = tf.logical_and(relevant_elems, accurate_elems[:, :tf.shape(relevant_elems)[1]])
+            # FP = (FP+TN) & (FP+FN)
+            fp_elems = tf.logical_and(non_relevant_elems, inaccurate_elems[:, :tf.shape(non_relevant_elems)[1]])
+
+            # accuracy = correctly predict (modified or not)
+            elem_total = tf.cast(tf.reduce_sum(target_lens), dtype=tf.float32)
+            elem_accurate_count = tf.count_nonzero(accurate_elems, dtype=tf.float32)
+            elem_accuracy = elem_accurate_count / elem_total
+            elem_tp_count = tf.count_nonzero(tp_elems, dtype=tf.float32)
+            elem_fp_count = tf.count_nonzero(fp_elems, dtype=tf.float32)
+            # precision = TP / TP+FP
+            elem_precision = elem_tp_count / (elem_tp_count + elem_fp_count)
+            elem_precision = tf.where(tf.is_nan(elem_precision), 0.0, elem_precision)
+            # recall = TP / TP+FN
+            elem_recall = elem_tp_count / elem_accurate_count
+            elem_recall = tf.where(tf.is_nan(elem_recall), 0.0, elem_recall)
+
+            return accuracy, precision, recall, copied, elem_accuracy, elem_precision, elem_recall
 
     def _build_loss(self, logits, expected, lengths):
         with tf.variable_scope('loss'):
@@ -260,7 +306,8 @@ class GrammarCorrectionModel(object):
         self._infer_outs = tf.identity(infer_outs, 'output/xs')
         self._infer_lens = tf.identity(infer_lens, 'output/xlens')
 
-        self._accuracy, self._precision, self._recall, self._copied = self._build_eval(self._zs_ph, self._ylens_ph)
+        self._accuracy, self._precision, self._recall, self._copied,\
+            self._elem_accuracy, self._elem_precision, self._elem_recall = self._build_eval(self._zs_ph, self._ylens_ph)
 
         self._v_summaries = tf.summary.merge([
             tf.summary.scalar('eval/loss', self._v_loss),
@@ -268,7 +315,10 @@ class GrammarCorrectionModel(object):
             tf.summary.scalar('eval/precision', self._precision),
             tf.summary.scalar('eval/recall', self._recall),
             tf.summary.scalar('eval/copy', self._copied),
-            ])
+            tf.summary.scalar('eval/accuracy_e', self._elem_accuracy),
+            tf.summary.scalar('eval/precision_e', self._elem_precision),
+            tf.summary.scalar('eval/recall_e', self._elem_recall),
+        ])
 
     def run(self, data_feeder, epochs):
         saver = tf.train.Saver()

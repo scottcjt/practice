@@ -2,13 +2,14 @@ import numpy as np
 
 import collections
 import random
+import re
 import string
 import tempfile
 
 
 _PEEPHOLES = [
-    ('a . m .', 'a.m.'),
-    ('. . . ', '...'),
+    ('a . m . ', 'a.m. '),
+    ('. . . ', '... '),
     # some n't is mis-processed to n ' t
     ('n \' t ', ' n\'t '),
     ('N \' T ', ' N\'T '),
@@ -24,6 +25,11 @@ def _peephole(line):
     for old, new in _PEEPHOLES:
         line = line.replace(old, new)
 
+    # The first letter of correct answer should always be capital letter.
+    def capitalize(m):
+        return m[0].upper()
+
+    line = re.sub('\t[a-z]', capitalize, line)
     return line
 
 
@@ -35,7 +41,13 @@ def _preprocessed(fp):
 
 def _tokenize(sentence, codebook):
     tokens = sentence.split()
-    ids = [codebook(tok) for tok in tokens]
+    ids = []
+    for tok in tokens:
+        x = codebook(tok)
+        if isinstance(x, list):
+            ids += x
+        else:
+            ids.append(x)
     return ids
 
 
@@ -140,6 +152,7 @@ class Lang8Data(object):
         unwanted = [self.word2code(x) for x in unwanted]
 
         valid_lines = []
+        total_unks = 0
         for i, line in enumerate(lines):
             x, y = line.split('\t')
             xt = _tokenize(x, self.word2code)
@@ -149,13 +162,14 @@ class Lang8Data(object):
                 continue
 
             c = collections.Counter(xt)
+            total_unks += c[self._unk]
             unwanted_count = sum([c[x] for x in unwanted])
             if unwanted_count >= (len(xt) / 2):
                 continue
 
             valid_lines.append(line + '\n')
 
-        print('Read in {} lines, keep {} lines'.format(i, len(valid_lines)))
+        print('Read in {} lines, keep {} lines (total {} <unk>s)'.format(i, len(valid_lines), total_unks))
 
         total = len(valid_lines)
         train_n = int(total * 0.8)
@@ -198,12 +212,21 @@ class Lang8Data(object):
     def _is_punct(cls, word):
         return len(word) == 1 and word not in cls._punct_whitelist and word in string.punctuation
 
-    def _build_codebook(self, lines, save_vocab_table):
+    def _build_codebook(self, lines):
+        if self._statfile:
+            def log(msg):
+                print(msg, file=self._statfile)
+        else:
+            def log(msg):
+                pass
+
         codes = ['<pad>', '<unk>',
                  '<start>', '<end>',
-                 '<num>', '<pun>'] + [c for c in self._punct_whitelist]
+                 '<num>', '<pun>',
+                 '<cap>', '<small>'] + [c for c in self._punct_whitelist]
         pick = self.vocab_size - len(codes)
 
+        total = 0
         counter = collections.Counter()
         for line in lines:
             # Pick words from `correct' parts.
@@ -217,12 +240,60 @@ class Lang8Data(object):
                 # exclude numbers
                 if self._is_digits(w):
                     continue
-                # exclude punctuations
+                # included punctuations
+                if w in self._punct_whitelist:
+                    continue
+                # excluded punctuations
                 if self._is_punct(w):
                     continue
                 counter[w] += 1
+                total += 1
+
+        log('raw words={} total_count={}'.format(len(counter), total))
+        log('')
+
+        # Try to merge the same word of capital/small letters.
+        WORD_MERGE_RATE = 3
+        all_smalls = collections.Counter()
+        non_smalls = collections.Counter()
+        for w, n in counter.items():
+            if w == w.lower():
+                all_smalls[w] = n
+            else:
+                non_smalls[w] = n
+
+        merged = 0
+        for w, n in non_smalls.items():
+            lower_w_count = all_smalls.get(w.lower(), 0)
+            if lower_w_count == 0:
+                continue
+            # If the same word appears both as lower and upper cases, compare their probabilities:
+            if lower_w_count > WORD_MERGE_RATE * n:
+                # Most appearances are lower case means it should be a lower case word.
+                counter[w.lower()] += n
+                del counter[w]
+                log('merge {} -> {} ({} vs {})'.format(w, w.lower(), n, lower_w_count))
+                merged += 1
+            elif lower_w_count * WORD_MERGE_RATE < n:
+                # Most appearances are upper/mixed case means it should be a upper case word?
+                counter[w] += lower_w_count
+                del counter[w.lower()]
+                log('merge {} -> {} ({} vs {})'.format(w.lower(), w, lower_w_count, n))
+                merged += 1
+            else:
+                log('{} / {} ({} vs {}) are preserved'.format(w, w.lower(), n, lower_w_count))
+
+        log('{} words are merged (coeff={})'.format(merged, WORD_MERGE_RATE))
 
         picked = counter.most_common(pick)
+        log('')
+        log('vocabs have appearance count < {} are discarded'.format(picked[-1][1]))
+
+        n = 0
+        for w, c in picked:
+            n += c
+        log('coverage rate: {}'.format(n / total))
+
         picked = map(lambda x: x[0], picked)
         codes.extend(picked)
         assert len(codes) <= self.vocab_size
@@ -232,9 +303,10 @@ class Lang8Data(object):
         self._unk = self.word_codebook['<unk>']
 
         # write vocab table
-        with open(save_vocab_table, mode='w') as fout:
-            for w in codes:
-                fout.write('{}\n'.format(w))
+        log('')
+        log('valid vocabs:')
+        for w in codes:
+            log(w)
 
     # def char_code(self, c):
     #     if c in self.char_codebook:
@@ -249,10 +321,38 @@ class Lang8Data(object):
         elif self._is_digits(w):
             return self.word_codebook['<num>']
         else:
-            return self.word_codebook.get(w, self._unk)
+            ret = self.word_codebook.get(w)
+            if ret:
+                return ret
+            # If we have 'Apple' but there is only 'apple' in dict,
+            # emit [<cap>, 'apple']
+            ret = self.word_codebook.get(w[0].lower() + w[1:])
+            if ret:
+                return [self.word_codebook['<cap>'], ret]
+            # Vise versa.
+            ret = self.word_codebook.get(w.upper() + w[1:])
+            if ret:
+                return [self.word_codebook['<small>'], ret]
+            return self._unk
 
     def code2word(self, c):
         return self.word_codebook_rev.get(c, '<oov>')
+
+    def reconstruct(self, ids):
+        ret = []
+        i = 0
+        while i < len(ids):
+            w = self.code2word(ids[i])
+            i += 1
+            if w == 'cap':
+                w = self.code2word(ids[i]).capitalize()
+                i += 1
+            elif w == 'small':
+                w = self.code2word(ids[i]).lower()
+                i += 1
+            ret.append(w)
+
+        return ' '.join(ret)
 
     @property
     def pad_symbol(self):
@@ -266,14 +366,22 @@ class Lang8Data(object):
     def end_symbol(self):
         return self.word_codebook['<end>']
 
-    def __init__(self, filename, save_vocab_table, vocab_size=20000):
+    def __init__(self, filename, statfile=None, vocab_size=20000):
         self.vocab_size = vocab_size
+
+        if statfile:
+            self._statfile = open(statfile, mode='w')
 
         with open(filename, mode='r') as fp:
             preprocessed = _preprocessed(fp)
-            self._build_codebook(preprocessed, save_vocab_table)
+            self._build_codebook(preprocessed)
+
             preprocessed = _preprocessed(fp)
             self._tidy_and_build_corpus(preprocessed)
+
+        if statfile:
+            self._statfile.close()
+            del self._statfile
 
     def next_batch(self, n=128, cat=TRAIN):
         data = self._cats[cat]
@@ -299,12 +407,17 @@ class Lang8Data(object):
         return self._train_n // batch_size
 
 
-# data = Lang8Data('lang8-10p', 'lang8-10p_vocab')
+# data = Lang8Data('lang8-1p', 'lang8_vocab')
 #
 # for _ in range(100):
 #     b = data.next_batch(cat=data.TEST)
-#     print(b)
-#
+#     for i, (seq, l) in enumerate(zip(b.xs, b.xlens)):
+#         text = data.reconstruct(seq[:l])
+#         if text[0].islower():
+#             answer = data.reconstruct(b.zs[i][:b.zlens[i]])
+#             print('In: ' + text)
+#             print('Expect: ' + answer)
+
 # b = data.next_batch(128)
 # for x, xl, y, yl, z, zl in zip(b.xs, b.xlens, b.ys, b.ylens, b.zs, b.zlens):
 #     xw = [data.code2word(c) for c in x]
