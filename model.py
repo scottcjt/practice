@@ -370,13 +370,13 @@ class GrammarCorrectionModel(object):
 
                         # Randomly pick a sample to display.
                         in_ids = batch.xs[0][:batch.xlens[0]]
-                        in_str = ' '.join([data_feeder.code2word(x) for x in in_ids])
+                        in_str = data_feeder.reconstruct(in_ids)
                         out_ids = v_out[0][:v_len[0]-1]
-                        out_str = ' '.join([data_feeder.code2word(x) for x in out_ids])
+                        out_str = data_feeder.reconstruct(out_ids)
                         if out_str == '':
                             out_str = '(empty string)'
                         answer_ids = batch.ys[0][1:batch.ylens[0]]
-                        answer_str = ' '.join([data_feeder.code2word(x) for x in answer_ids])
+                        answer_str = data_feeder.reconstruct(answer_ids)
 
                         print('batch {:5d}: loss={:.4f} v_loss={:.4f} norm={:.4f}'.format(i, loss, v_loss, grad_norm))
                         print('sample in  : ' + in_str)
