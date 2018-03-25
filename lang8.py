@@ -27,7 +27,7 @@ def _peephole(line):
 
     # The first letter of correct answer should always be capital letter.
     def capitalize(m):
-        return m[0].upper()
+        return m.group(0).upper()
 
     line = re.sub('\t[a-z]', capitalize, line)
     return line
